@@ -1,0 +1,293 @@
+function result = restore_wagner_from_flexible_direct(validation_time_s)
+%RESTORE_WAGNER_FROM_FLEXIBLE_DIRECT Restore Wagner states at flexible trim.
+%
+% Run order:
+%   trim_flexible_direct_findop
+%   restore_wagner_from_flexible_direct
+%
+% Plant: aerodynamic_model_V1_1_Coupling.slx
+% The rigid states, controls and structural initial displacement from the
+% direct joint trim are preserved. Only the four Wagner state vectors are
+% calculated and restored. Downwash remains disabled.
+
+if nargin < 1
+    validation_time_s = 0.3;
+end
+
+%% ================= USER-EDITABLE SETTINGS =================
+enable_downwash  = false;
+bypass_delays    = true;
+correct_tail_sign = true;
+%% ==========================================================
+
+root_dir = fileparts(fileparts(mfilename('fullpath')));
+cd(root_dir);
+addpath(fullfile(root_dir, 'trim'));
+
+if ~evalin('base', "exist('aeroelastic_direct_result','var')")
+    error(['Missing aeroelastic_direct_result. Run ' ...
+        'trim_flexible_direct_findop first in the same MATLAB session.']);
+end
+direct = evalin('base', 'aeroelastic_direct_result');
+if ~isfield(direct, 'converged') || ~direct.converged
+    if isfield(direct, 'max_residual')
+        error(['The direct flexible trim did not converge ' ...
+            '(max residual %.3e); Wagner restoration stopped.'], ...
+            direct.max_residual);
+    end
+    error(['The direct flexible trim did not converge; ' ...
+        'Wagner restoration stopped.']);
+end
+if isfield(direct, 'ok') && ~direct.ok
+    warning(['The direct trim equations converged, but its previous dynamic ' ...
+        'hold check did not pass. Wagner restoration will continue and run ' ...
+        'a new %.3g s hold check.'], validation_time_s);
+end
+
+required = {'As', 'Bs', 'Cs', 'Ds', ...
+    'trim_Velocity_b0', 'trim_Omega_b0', 'trim_Position0', ...
+    'trim_Attitude_rad0', 'Ad_wing_L', 'Bd_wing_L', ...
+    'Cd_wing_L', 'Dd_wing_L', 'Ad_wing_R', 'Bd_wing_R', ...
+    'Cd_wing_R', 'Dd_wing_R', 'Ad_v_tail_L', 'Bd_v_tail_L', ...
+    'Cd_v_tail_L', 'Dd_v_tail_L', 'Ad_v_tail_R', 'Bd_v_tail_R', ...
+    'Cd_v_tail_R', 'Dd_v_tail_R'};
+for i = 1:numel(required)
+    if ~evalin('base', sprintf("exist('%s','var')", required{i}))
+        error('Workspace variable %s is missing.', required{i});
+    end
+end
+
+mdl = 'aerodynamic_model_V1_1_Coupling';
+load_system(mdl);
+
+n_mode = numel(direct.eta);
+x0_structure = [direct.eta(:); zeros(n_mode, 1)];
+tilt_cmd_rad = result_field_(direct, 'tilt_cmd_rad', zeros(8, 1));
+dot_tilt_cmd_radps = result_field_( ...
+    direct, 'dot_tilt_cmd_radps', zeros(8, 1));
+aileron_deg = result_field_(direct, 'aileron_deg', 0);
+rudder_deg = result_field_(direct, 'rudder_deg', 0);
+blade_pitch_deg = result_field_(direct, 'blade_pitch_deg', []);
+input_data = root_input_dataset_(direct.rpm, tilt_cmd_rad, ...
+    dot_tilt_cmd_radps, aileron_deg, direct.elevator_deg, rudder_deg, ...
+    max(validation_time_s, 1.0));
+
+% Reassert the direct flexible trim without rerunning the initialization file.
+assignin('base', 'trim_RPM_cmd', direct.rpm(:));
+assignin('base', 'trim_Tilt_cmd_rad', tilt_cmd_rad(:));
+assignin('base', 'trim_dotTilt_cmd_radps', dot_tilt_cmd_radps(:));
+assignin('base', 'trim_Aileron_deg', aileron_deg);
+assignin('base', 'trim_Elevator_deg', direct.elevator_deg);
+assignin('base', 'trim_Rudder_deg', rudder_deg);
+if ~isempty(blade_pitch_deg)
+    assignin('base', 'BladePitch_deg', blade_pitch_deg);
+end
+assignin('base', 'x0_structure', x0_structure);
+assignin('base', 'trim_input_dataset', input_data);
+
+configure_common_(mdl, enable_downwash, bypass_delays, correct_tail_sign);
+structure = [mdl '/Flexible Aircraft Dynamics/Structure_SS'];
+set_param(structure, 'C', 'Cs', 'D', 'Ds');
+
+% First obtain the quasi-steady strip CL at the already deformed geometry.
+set_wagner_(mdl, false);
+set_param(mdl, 'SimulationCommand', 'update');
+CL_qs = sample_quasi_steady_cl_(mdl, input_data, x0_structure, n_mode);
+
+names = {'wing_L', 'wing_R', 'v_tail_L', 'v_tail_R'};
+aero_ic = struct();
+for i = 1:numel(names)
+    name = names{i};
+    A = evalin('base', ['Ad_' name]);
+    B = evalin('base', ['Bd_' name]);
+    C = evalin('base', ['Cd_' name]);
+    D = evalin('base', ['Dd_' name]);
+    cl = CL_qs.(name);
+    x0 = (eye(size(A)) - A) \ (B * cl);
+    cl0 = C * x0 + D * cl;
+
+    aero_ic.(name) = struct( ...
+        'CL_qs', cl, ...
+        'CL_wagner0', cl0, ...
+        'x0_wagner', x0, ...
+        'alpha_du0', zeros(numel(cl), 1), ...
+        'state_residual', max(abs(A*x0 + B*cl - x0)), ...
+        'output_error', max(abs(cl0 - cl)));
+
+    assignin('base', ['x0_wagner_' name], x0);
+    assignin('base', ['alpha_du0_' name], zeros(numel(cl), 1));
+end
+assignin('base', 'restored_aero_ic', aero_ic);
+
+% Restore Wagner while retaining the real structure dynamics and trim eta.
+set_wagner_(mdl, true);
+set_param(mdl, ...
+    'LoadInitialState', 'off', ...
+    'LoadExternalInput', 'on', ...
+    'ExternalInput', 'trim_input_dataset', ...
+    'StopTime', num2str(validation_time_s, 16), ...
+    'SimulationCommand', 'update');
+
+sim_in = Simulink.SimulationInput(mdl);
+sim_in = sim_in.setExternalInput(input_data);
+sim_in = sim_in.setModelParameter( ...
+    'StopTime', num2str(validation_time_s, 16), ...
+    'SaveOutput', 'on', 'OutputSaveName', 'yout', 'SaveFormat', 'Dataset');
+sim_out = sim(sim_in);
+
+dyn = sim_out.yout.getElement('Out_Dynamics').Values;
+aero_out = sim_out.yout.getElement('Out_Aero').Values;
+velocity = channels_by_time_(dyn.Velocity_b.Data, 3);
+omega = channels_by_time_(dyn.Omega_b.Data, 3);
+eta = channels_by_time_(dyn.elastic_displacement.Data, n_mode);
+
+cl_error.wing_L = first_error_(aero_out.CL_strip_c_LW.Data, ...
+    aero_out.CL_strip_qs_LW.Data, 20);
+cl_error.wing_R = first_error_(aero_out.CL_strip_c_RW.Data, ...
+    aero_out.CL_strip_qs_RW.Data, 20);
+cl_error.v_tail_L = first_error_(aero_out.CL_strip_c_LT.Data, ...
+    aero_out.CL_strip_qs_LT.Data, 5);
+cl_error.v_tail_R = first_error_(aero_out.CL_strip_c_RT.Data, ...
+    aero_out.CL_strip_qs_RT.Data, 5);
+
+result = struct();
+result.model = mdl;
+result.source = 'flexible_direct';
+result.enable_downwash = enable_downwash;
+result.bypass_delays = bypass_delays;
+result.aero_ic = aero_ic;
+result.x0_structure = x0_structure;
+result.wagner_first_sample_error = cl_error;
+result.max_wagner_error = max(structfun(@max, cl_error));
+result.delta_velocity = velocity(:, end) - velocity(:, 1);
+result.delta_omega = omega(:, end) - omega(:, 1);
+result.delta_eta = eta(:, end) - direct.eta(:);
+result.delta_eta_norm = norm(result.delta_eta);
+result.hold_ok = max(abs(result.delta_velocity)) < 0.10 && ...
+    max(abs(result.delta_omega)) < 0.01 && result.delta_eta_norm < 0.05;
+result.ok = result.max_wagner_error < 1e-8 && result.hold_ok;
+result.workspace_ready = result.ok;
+
+assignin('base', 'wagner_flexible_result', result);
+assignin('base', 'wagner_result', result);
+
+fprintf('\n=== Wagner restoration from direct flexible trim ===\n');
+fprintf('Source                         : flexible_direct\n');
+fprintf('Structure preserved, |eta|     : %.6e\n', norm(direct.eta));
+fprintf('max |CL_Wagner(0)-CL_qs(0)|   : %.3e\n', result.max_wagner_error);
+fprintf('Delta Velocity_b(%g s)         : %s m/s\n', validation_time_s, ...
+    mat2str(result.delta_velocity.', 6));
+fprintf('Delta Omega_b(%g s)            : %s rad/s\n', validation_time_s, ...
+    mat2str(result.delta_omega.', 6));
+fprintf('Delta eta norm                 : %.3e\n', result.delta_eta_norm);
+fprintf('Ready to simulate              : %d\n', result.ok);
+fprintf('The model is configured in memory only; the slx file was not saved.\n');
+end
+
+
+function CL = sample_quasi_steady_cl_(mdl, input_data, x0_structure, n_mode)
+sim_in = Simulink.SimulationInput(mdl);
+sim_in = sim_in.setExternalInput(input_data);
+% Hold eta fixed only while sampling the quasi-steady strip loads.
+sim_in = sim_in.setVariable('As', eye(2*n_mode));
+sim_in = sim_in.setVariable('Bs', zeros(2*n_mode, n_mode));
+sim_in = sim_in.setVariable('x0_structure', x0_structure);
+sim_in = sim_in.setModelParameter( ...
+    'StopTime', '0.02', 'SaveOutput', 'on', ...
+    'OutputSaveName', 'yout', 'SaveFormat', 'Dataset');
+out = sim(sim_in);
+aero = out.yout.getElement('Out_Aero').Values;
+
+CL.wing_L = first_sample_(aero.CL_strip_qs_LW.Data, 20);
+CL.wing_R = first_sample_(aero.CL_strip_qs_RW.Data, 20);
+CL.v_tail_L = first_sample_(aero.CL_strip_qs_LT.Data, 5);
+CL.v_tail_R = first_sample_(aero.CL_strip_qs_RT.Data, 5);
+end
+
+
+function configure_common_(mdl, enable_downwash, bypass_delays, correct_tail_sign)
+surfaces = {'Left_Wing', 'Right_Wing', 'Left_Tail', 'Right_Tail'};
+for i = 1:numel(surfaces)
+    base = [mdl '/Strip Aerodynamics/' surfaces{i}];
+    if enable_downwash
+        set_param([base '/From_adu'], 'Commented', 'off');
+    else
+        set_param([base '/From_adu'], 'Commented', 'on');
+    end
+end
+if bypass_delays
+    set_param([mdl '/Strip Aerodynamics/Delay_Dynamics'], 'Commented', 'through');
+    set_param([mdl '/Propulsion Dynamics/Delay_Dynamic'], 'Commented', 'through');
+end
+if correct_tail_sign
+    set_param([mdl '/Strip Aerodynamics/cant_Tail'], 'Value', '-v_tail_cant_rad');
+end
+end
+
+
+function set_wagner_(mdl, enabled)
+surfaces = {'Left_Wing', 'Right_Wing', 'Left_Tail', 'Right_Tail'};
+for i = 1:numel(surfaces)
+    block = [mdl '/Strip Aerodynamics/' surfaces{i} '/Wagner_SS'];
+    if enabled
+        set_param(block, 'Commented', 'off');
+    else
+        set_param(block, 'Commented', 'through');
+    end
+end
+end
+
+
+function data = root_input_dataset_(rpm, tilt, dot_tilt, aileron, ...
+        elevator, rudder, stop_time)
+t = [0; stop_time];
+rpm = rpm(:);
+tilt = tilt(:);
+dot_tilt = dot_tilt(:);
+data = Simulink.SimulationData.Dataset;
+data = data.addElement(timeseries([rpm.'; rpm.'], t), 'Throttle');
+data = data.addElement(timeseries([tilt.'; tilt.'], t), 'Tilt_cmd');
+data = data.addElement(timeseries([dot_tilt.'; dot_tilt.'], t), 'dotTilt_cmd');
+data = data.addElement(timeseries(aileron*ones(2, 1), t), 'Aileron');
+data = data.addElement(timeseries(elevator*ones(2, 1), t), 'Elevator');
+data = data.addElement(timeseries(rudder*ones(2, 1), t), 'Rudder');
+end
+
+
+function value = result_field_(result, name, fallback)
+if isfield(result, name)
+    value = result.(name);
+else
+    value = fallback;
+end
+end
+
+
+function value = first_sample_(data, n_channel)
+signal = channels_by_time_(data, n_channel);
+value = signal(:, 1);
+end
+
+
+function value = first_error_(wagner_data, qs_data, n_channel)
+wagner = channels_by_time_(wagner_data, n_channel);
+quasi = channels_by_time_(qs_data, n_channel);
+value = abs(wagner(:, 1) - quasi(:, 1));
+end
+
+
+function y = channels_by_time_(data, n_channel)
+y = squeeze(data);
+if isvector(y)
+    y = y(:);
+end
+if size(y, 1) == n_channel
+    return
+end
+if size(y, 2) == n_channel
+    y = y.';
+    return
+end
+error('Cannot reshape data of size %s into %d channels.', ...
+    mat2str(size(y)), n_channel);
+end
